@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import EVACUATION_STATUSES, ID_PREFIX, REPORT_STATUSES, STATES
 
 
 class Repository:
@@ -24,6 +24,8 @@ class Repository:
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
+        evac_statuses = ",".join("'" + s.replace("'", "''") + "'" for s in EVACUATION_STATUSES)
+        report_statuses = ",".join("'" + s.replace("'", "''") + "'" for s in REPORT_STATUSES)
         with self.conn:
             self.conn.executescript(f"""
                 CREATE TABLE IF NOT EXISTS items (
@@ -50,9 +52,37 @@ class Repository:
                     status TEXT NOT NULL DEFAULT 'open'
                         CHECK(status IN ('open','closed')),
                     external_ref TEXT,
+                    zone TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
+                );
+                CREATE TABLE IF NOT EXISTS evacuations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    zone TEXT NOT NULL,
+                    teams TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'blocked'
+                        CHECK(status IN ({evac_statuses})),
+                    external_ref TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    reopened_by TEXT,
+                    reopened_at TEXT,
+                    UNIQUE(item_id, external_ref)
+                );
+                CREATE TABLE IF NOT EXISTS rollcall_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    evacuation_id INTEGER NOT NULL REFERENCES evacuations(id) ON DELETE CASCADE,
+                    team TEXT NOT NULL,
+                    report_ref TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ({report_statuses})),
+                    equipment_returned INTEGER NOT NULL DEFAULT 0,
+                    needs_review INTEGER NOT NULL DEFAULT 0,
+                    conflict_detail TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(evacuation_id, report_ref)
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,6 +96,9 @@ class Repository:
                     created_at TEXT NOT NULL
                 );
             """)
+            record_columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(records)")}
+            if "zone" not in record_columns:
+                self.conn.execute("ALTER TABLE records ADD COLUMN zone TEXT")
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -124,15 +157,16 @@ class Repository:
         return self.get_item(item_id)
 
     def add_record(self, item_id: int, kind: str, detail: str, status: str,
-                   external_ref: Optional[str], actor: str) -> Dict[str, Any]:
+                   external_ref: Optional[str], actor: str,
+                   zone: Optional[str] = None) -> Dict[str, Any]:
         now = utc_now()
         self.get_item(item_id)
         try:
             with self._lock, self.conn:
                 cur = self.conn.execute(
                     """INSERT INTO records(item_id, kind, detail, status, external_ref,
-                       created_by, created_at) VALUES(?,?,?,?,?,?,?)""",
-                    (item_id, kind, detail, status, external_ref, actor, now),
+                       zone, created_by, created_at) VALUES(?,?,?,?,?,?,?,?)""",
+                    (item_id, kind, detail, status, external_ref, zone, actor, now),
                 )
                 record_id = int(cur.lastrowid)
         except sqlite3.IntegrityError as exc:
@@ -156,6 +190,132 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    # ---- 撤离点名台账 ----
+    @staticmethod
+    def _evacuation(row: sqlite3.Row) -> Dict[str, Any]:
+        item = dict(row)
+        item["teams"] = json.loads(item["teams"])
+        return item
+
+    @staticmethod
+    def _report(row: sqlite3.Row) -> Dict[str, Any]:
+        item = dict(row)
+        item["equipment_returned"] = bool(item["equipment_returned"])
+        item["needs_review"] = bool(item["needs_review"])
+        if item.get("conflict_detail"):
+            item["conflict_detail"] = json.loads(item["conflict_detail"])
+        return item
+
+    def create_evacuation(self, item_id: int, zone: str, teams: List[str],
+                          external_ref: Optional[str], actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        self.get_item(item_id)
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO evacuations(item_id, zone, teams, status, external_ref,
+                       created_by, created_at) VALUES(?,?,?,?,?,?,?)""",
+                    (item_id, zone, json.dumps(teams, ensure_ascii=False), "blocked",
+                     external_ref, actor, now),
+                )
+                evacuation_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("撤离单唯一标识已存在") from exc
+        return self.get_evacuation(evacuation_id)
+
+    def get_evacuation(self, evacuation_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM evacuations WHERE id=?", (evacuation_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("撤离单不存在")
+        return self._evacuation(row)
+
+    def list_evacuations(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM evacuations WHERE item_id=? ORDER BY id", (item_id,)).fetchall()
+        return [self._evacuation(row) for row in rows]
+
+    def list_blocking_evacuations(self, item_id: int, zone: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT * FROM evacuations
+                   WHERE item_id=? AND zone=? AND status='blocked' ORDER BY id""",
+                (item_id, zone)).fetchall()
+        return [self._evacuation(row) for row in rows]
+
+    def reopen_evacuation(self, evacuation_id: int, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE evacuations SET status='reopened', reopened_by=?, reopened_at=?
+                   WHERE id=? AND status='blocked'""",
+                (actor, now, evacuation_id),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM evacuations WHERE id=?", (evacuation_id,)).fetchone()
+                if exists is None:
+                    raise NotFoundError("撤离单不存在")
+                raise ConflictError("撤离单已重新开放")
+        return self.get_evacuation(evacuation_id)
+
+    def add_report(self, evacuation_id: int, team: str, report_ref: str, status: str,
+                   equipment_returned: bool, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        self.get_evacuation(evacuation_id)
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO rollcall_reports(evacuation_id, team, report_ref, status,
+                       equipment_returned, needs_review, created_by, created_at)
+                       VALUES(?,?,?,?,?,0,?,?)""",
+                    (evacuation_id, team, report_ref, status, int(equipment_returned),
+                     actor, now),
+                )
+                report_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("现场单号已存在") from exc
+        return self.get_report(report_id)
+
+    def get_report(self, report_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM rollcall_reports WHERE id=?", (report_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("点名记录不存在")
+        return self._report(row)
+
+    def get_report_by_ref(self, evacuation_id: int, report_ref: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM rollcall_reports WHERE evacuation_id=? AND report_ref=?",
+                (evacuation_id, report_ref)).fetchone()
+        return self._report(row) if row is not None else None
+
+    def list_reports(self, evacuation_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM rollcall_reports WHERE evacuation_id=? ORDER BY id",
+                (evacuation_id,)).fetchall()
+        return [self._report(row) for row in rows]
+
+    def mark_equipment_returned(self, report_id: int) -> Dict[str, Any]:
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE rollcall_reports SET equipment_returned=1 WHERE id=?", (report_id,))
+        return self.get_report(report_id)
+
+    def mark_report_conflict(self, report_id: int, attempt: Dict[str, Any]) -> Dict[str, Any]:
+        attempt = dict(attempt, attempted_at=utc_now())
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE rollcall_reports SET needs_review=1, conflict_detail=? WHERE id=?",
+                (json.dumps(attempt, ensure_ascii=False, sort_keys=True), report_id))
+        return self.get_report(report_id)
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:

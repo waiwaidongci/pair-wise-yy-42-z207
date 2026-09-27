@@ -20,3 +20,39 @@ def validate_transition(current,target):
     if not can_transition(current,target): raise ConflictError(f"不能从{current}转换到{target}")
 def completion_blockers(target,open_records): return ["仍有未关闭事项"] if target in TERMINAL_STATES and open_records>0 else []
 def role_for_transition(target): return set(TRANSITION_ROLES.get(target,[]))
+# ---- 撤离点名判定 ----
+EVAC_ENTITY='撤离单'; EVACUATION_STATUSES=['blocked','reopened']; REPORT_STATUSES=['accounted','missing']
+EVACUATE_ROLES=set(['incident_commander']); REPORT_ROLES=set(['field_commander','logistics']); REOPEN_ROLES=set(['incident_commander'])
+def normalize_teams(value):
+    if not isinstance(value,(list,tuple)) or not value: raise ValidationError("teams必须是非空班组列表")
+    teams=[]
+    for entry in value:
+        if not isinstance(entry,str) or not entry.strip(): raise ValidationError("班组名称不能为空")
+        name=entry.strip()
+        if len(name)>100: raise ValidationError("班组名称不能超过100个字符")
+        if name not in teams: teams.append(name)
+    if len(teams)>50: raise ValidationError("班组数量不能超过50个")
+    return teams
+def normalize_report_status(value):
+    if value not in REPORT_STATUSES: raise ValidationError("status必须是accounted或missing")
+    return value
+def classify_report(existing,team,status,equipment_returned):
+    # 同号重复沿用首次结果；同号同状态补报装备归还则升级；矛盾状态留待核对且首次结果不变
+    if existing is None: return 'new'
+    if existing["team"]!=team or existing["status"]!=status: return 'conflict'
+    if bool(existing["equipment_returned"])==bool(equipment_returned): return 'reuse'
+    return 'supplement' if equipment_returned else 'conflict'
+def _team_reports(team,reports): return [r for r in reports if r["team"]==team]
+def accounted_teams(teams,reports): return [t for t in teams if any(r["status"]=="accounted" for r in _team_reports(t,reports))]
+def unaccounted_teams(teams,reports):
+    accounted=set(accounted_teams(teams,reports))
+    return [t for t in teams if t not in accounted]
+def equipment_pending_teams(teams,reports): return [t for t in teams if not any(r["equipment_returned"] for r in _team_reports(t,reports))]
+def reopen_blockers(teams,reports):
+    # 人员核销且装备归还后才能重新开放
+    blockers=[]
+    missing=unaccounted_teams(teams,reports)
+    if missing: blockers.append("班组未核销："+"、".join(missing))
+    pending=equipment_pending_teams(teams,reports)
+    if pending: blockers.append("装备未归还："+"、".join(pending))
+    return blockers

@@ -71,7 +71,11 @@ def make_handler(service: Service, static_dir: str):
                 status = 400
             else:
                 status = 500
-            self._json(status, {"error": exc.__class__.__name__, "message": str(exc)})
+            payload: Dict[str, Any] = {"error": exc.__class__.__name__, "message": str(exc)}
+            details = getattr(exc, "details", None)
+            if details:
+                payload["details"] = details
+            self._json(status, payload)
 
         def do_GET(self) -> None:
             try:
@@ -89,6 +93,16 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"records": service.list_records(item_id, role)})
+                elif path.startswith("/api/items/") and path.endswith("/evacuations"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"evacuations": service.list_evacuations(item_id, role)})
+                elif path.startswith("/api/evacuations/"):
+                    evacuation_id = int(path.rsplit("/", 1)[-1])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.get_evacuation(evacuation_id, role))
                 elif path.startswith("/api/items/"):
                     item_id = int(path.rsplit("/", 1)[-1])
                     actor, role = self._identity()
@@ -119,6 +133,16 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/evacuations"):
+                    item_id = int(path.split("/")[3])
+                    self._json(201, service.create_evacuation(item_id, body, actor, role))
+                elif path.startswith("/api/evacuations/") and path.endswith("/reports"):
+                    evacuation_id = int(path.split("/")[3])
+                    result = service.report_rollcall(evacuation_id, body, actor, role)
+                    self._json(201 if result.get("result") == "recorded" else 200, result)
+                elif path.startswith("/api/evacuations/") and path.endswith("/reopen"):
+                    evacuation_id = int(path.split("/")[3])
+                    self._json(200, service.reopen_evacuation(evacuation_id, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:

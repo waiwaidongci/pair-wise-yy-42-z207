@@ -30,9 +30,21 @@ python3 app.py --db ./data.db --port 8319
 - `GET /api/items/{id}`
 - `POST /api/items/{id}/records`
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
+- `POST /api/items/{id}/evacuations`，登记撤离单（`zone`任务区+`teams`班组），仅incident_commander
+- `GET /api/items/{id}/evacuations`，撤离单与点名进度
+- `GET /api/evacuations/{id}`，撤离单详情与点名台账
+- `POST /api/evacuations/{id}/reports`，班组按现场单号`report_ref`回报（`status`为accounted/missing，`equipment_returned`标记装备归还）
+- `POST /api/evacuations/{id}/reopen`，重新开放，仅incident_commander
 - `GET /api/audit`
 
 允许角色：field_commander, incident_commander, logistics, viewer。火线长度、风向变化和离线记录数量影响风险等级；同一资源不能同时出现在多个活动任务中。
+
+## 撤离点名与重新开放
+
+- 撤离单登记任务区与班组后，该任务区进入封锁（blocked）；`kind=dispatch`的派单记录必须携带`zone`。
+- 班组按现场单号回报状态：同号重复沿用首次结果（返回`reused`）；同号同状态补报装备归还记为`supplemented`；同号矛盾状态标记`needs_review`留待核对，首次结果不变，核对后请用新现场单号补报。
+- 封锁区有人未核销时，新派单返回409冲突并在`details.missing_teams`中列出缺失班组。
+- 所有班组人员核销（accounted）且装备归还后才能重新开放（reopened）；重新开放后停止点名，派单恢复。
 
 ## 测试
 
