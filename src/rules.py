@@ -20,3 +20,34 @@ def validate_transition(current,target):
     if not can_transition(current,target): raise ConflictError(f"不能从{current}转换到{target}")
 def completion_blockers(target,open_records): return ["仍有未关闭事项"] if target in TERMINAL_STATES and open_records>0 else []
 def role_for_transition(target): return set(TRANSITION_ROLES.get(target,[]))
+
+# ---- 撤离点名与重新开放 ----
+EVAC_ENTITY='撤离单'; DISPATCH_ENTITY='派单'
+EVAC_ORDER_STATUSES=['active','reopened']
+REPORT_STATUSES=['arrived','missing']
+EVAC_CREATE_ROLES=set(['incident_commander']); REPORT_ROLES=set(['field_commander', 'logistics']); EQUIPMENT_ROLES=set(['logistics']); REOPEN_ROLES=set(['incident_commander']); DISPATCH_ROLES=set(['incident_commander'])
+def evaluate_rollcall(crews,reports,reviews=None):
+    """按班组汇总现场回报：同号重复沿用首次结果，矛盾状态留待核对。
+    crews为登记班组名单，reports为按时间排序的回报记录，reviews为核对结论
+    {班组:状态}（核对后以其为准），结果按名册顺序输出。"""
+    first={}
+    for report in reports:
+        first.setdefault(report['crew'],report['status'])
+    reviewed=dict(reviews or {})
+    effective={c:reviewed.get(c,first.get(c)) for c in crews}
+    arrived=[c for c in crews if effective.get(c)=='arrived']
+    missing=[c for c in crews if effective.get(c)=='missing']
+    silent=[c for c in crews if effective.get(c) is None]
+    disputed=[c for c in crews if c in first and c not in reviewed
+              and any(r['crew']==c and r['status']!=first[c] for r in reports)]
+    unknown=sorted(set([r['crew'] for r in reports if r['crew'] not in crews]))
+    pending=set(missing)|set(silent)|set(disputed)
+    unaccounted=[c for c in crews if c in pending]
+    return {'arrived':arrived,'missing':missing,'silent':silent,'disputed':disputed,'unknown':unknown,'reviewed':sorted(reviewed),'unaccounted':unaccounted,'accounted':not unaccounted and not unknown}
+def reopen_blockers(rollcall,equipment_returned):
+    """人员全部核销且装备归还后才允许重新开放。"""
+    blockers=[]
+    if rollcall['unaccounted']: blockers.append('存在未核销人员：'+','.join(rollcall['unaccounted']))
+    if rollcall['unknown']: blockers.append('存在未登记班组回报：'+','.join(rollcall['unknown']))
+    if not equipment_returned: blockers.append('装备未归还')
+    return blockers

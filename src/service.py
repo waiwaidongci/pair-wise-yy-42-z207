@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ConflictError, ensure_role, normalize_severity,
+                     require_number, require_text)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
+from .rules import (AUDIT_ROLES, CREATE_ROLES, DISPATCH_ENTITY, DISPATCH_ROLES,
+                    ENTITY, EQUIPMENT_ROLES, EVAC_CREATE_ROLES, EVAC_ENTITY,
+                    RECORD_ROLES, REOPEN_ROLES, REPORT_ROLES, REPORT_STATUSES,
+                    TITLE, VIEW_ROLES, completion_blockers, escalation_required,
+                    evaluate_rollcall, priority_score, reopen_blockers,
+                    response_deadline_hours, role_for_transition,
                     validate_transition)
 
 
@@ -90,6 +94,206 @@ class Service:
     def audit(self, role: str, item_id: Optional[int] = None) -> list:
         ensure_role(role, AUDIT_ROLES)
         return self.repository.list_audit(item_id)
+
+    # ---- 撤离点名与重新开放 ----
+
+    def _evacuation_detail(self, order: Dict[str, Any]) -> Dict[str, Any]:
+        crews = self.repository.list_crews(order["id"])
+        reports = self.repository.list_evacuation_reports(order["id"])
+        reviews = self.repository.list_evacuation_reviews(order["id"])
+        rollcall = evaluate_rollcall(
+            crews, reports, {r["crew"]: r["status"] for r in reviews})
+        result = dict(order)
+        result["crews"] = crews
+        result["reports"] = reports
+        result["reviews"] = reviews
+        result["rollcall"] = rollcall
+        result["reopen_blockers"] = reopen_blockers(
+            rollcall, bool(order["equipment_returned"]))
+        return result
+
+    def create_evacuation(self, payload: Dict[str, Any], actor: str,
+                          role: str) -> Dict[str, Any]:
+        ensure_role(role, EVAC_CREATE_ROLES)
+        actor = require_text(actor, "actor", 100)
+        order_no = require_text(payload.get("order_no"), "order_no", 100)
+        area = require_text(payload.get("area"), "area", 200)
+        reason = require_text(payload.get("reason"), "reason")
+        raw_crews = payload.get("crews")
+        if not isinstance(raw_crews, list) or not raw_crews:
+            from .domain import ValidationError
+            raise ValidationError("crews必须为非空班组名单")
+        crews, seen = [], set()
+        for raw_crew in raw_crews:
+            crew = require_text(raw_crew, "crew", 100)
+            if crew in seen:
+                from .domain import ValidationError
+                raise ValidationError(f"班组重复登记：{crew}")
+            seen.add(crew)
+            crews.append(crew)
+        if self.repository.active_evacuation_for_area(area) is not None:
+            raise ConflictError(f"任务区{area}已有进行中的撤离单")
+        order = self.repository.create_evacuation_order(
+            order_no, area, reason, crews, actor)
+        self.repository.append_audit("evacuation_create", EVAC_ENTITY, order["id"], actor, {
+            "order_no": order_no, "area": area, "crews": crews,
+        })
+        return self._evacuation_detail(order)
+
+    def report_evacuation(self, order_no: str, payload: Dict[str, Any],
+                          actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, REPORT_ROLES)
+        actor = require_text(actor, "actor", 100)
+        order = self.repository.get_evacuation_order_by_no(
+            require_text(order_no, "order_no", 100))
+        crew = require_text(payload.get("crew"), "crew", 100)
+        status = payload.get("status")
+        if status not in REPORT_STATUSES:
+            from .domain import ValidationError
+            raise ValidationError("status必须是arrived或missing")
+        note = payload.get("note")
+        if note is not None:
+            note = require_text(note, "note")
+        crews = self.repository.list_crews(order["id"])
+        if crew not in crews:
+            from .domain import ValidationError
+            raise ValidationError(f"班组{crew}不在撤离单名册中")
+        if order["status"] != "active":
+            raise ConflictError("撤离单已重新开放，不再接收回报")
+        reports = self.repository.list_evacuation_reports(order["id"])
+        prior = next((r for r in reports if r["crew"] == crew), None)
+        duplicate = prior is not None
+        if duplicate:
+            # 同号重复沿用首次结果；矛盾状态留待核对，只登记不改变点名判定
+            if prior["status"] != status:
+                self.repository.append_audit("evacuation_report_conflict",
+                                             EVAC_ENTITY, order["id"], actor, {
+                    "order_no": order["order_no"], "crew": crew,
+                    "first_status": prior["status"], "conflict_status": status,
+                })
+                report = self.repository.add_evacuation_report(
+                    order["id"], crew, status, note, actor)
+                self.repository.append_audit("evacuation_report",
+                                             EVAC_ENTITY, order["id"], actor, {
+                    "order_no": order["order_no"], "crew": crew, "status": status,
+                    "disputed": True,
+                })
+                detail = self._evacuation_detail(order)
+                detail["report"] = report
+                detail["duplicate"] = True
+                detail["disputed"] = True
+                return detail
+            # 同号同状态：沿用首次结果，不重复落账
+            detail = self._evacuation_detail(order)
+            detail["report"] = prior
+            detail["duplicate"] = True
+            detail["disputed"] = False
+            return detail
+        report = self.repository.add_evacuation_report(
+            order["id"], crew, status, note, actor)
+        self.repository.append_audit("evacuation_report", EVAC_ENTITY, order["id"], actor, {
+            "order_no": order["order_no"], "crew": crew, "status": status,
+        })
+        detail = self._evacuation_detail(order)
+        detail["report"] = report
+        detail["duplicate"] = False
+        detail["disputed"] = False
+        return detail
+
+    def review_evacuation_crew(self, order_id: int, payload: Dict[str, Any],
+                               actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, REOPEN_ROLES)
+        actor = require_text(actor, "actor", 100)
+        order = self.repository.get_evacuation_order(order_id)
+        if order["status"] != "active":
+            raise ConflictError("撤离单已重新开放，不再接收核对")
+        crew = require_text(payload.get("crew"), "crew", 100)
+        status = payload.get("status")
+        if status not in REPORT_STATUSES:
+            from .domain import ValidationError
+            raise ValidationError("status必须是arrived或missing")
+        note = payload.get("note")
+        if note is not None:
+            note = require_text(note, "note")
+        if crew not in self.repository.list_crews(order_id):
+            from .domain import ValidationError
+            raise ValidationError(f"班组{crew}不在撤离单名册中")
+        review = self.repository.add_evacuation_review(
+            order_id, crew, status, note, actor)
+        self.repository.append_audit("evacuation_review", EVAC_ENTITY, order_id, actor, {
+            "order_no": order["order_no"], "crew": crew, "status": status,
+        })
+        detail = self._evacuation_detail(order)
+        detail["review"] = review
+        return detail
+
+    def return_equipment(self, order_id: int, payload: Dict[str, Any], actor: str,
+                         role: str) -> Dict[str, Any]:
+        ensure_role(role, EQUIPMENT_ROLES)
+        actor = require_text(actor, "actor", 100)
+        order = self.repository.get_evacuation_order(order_id)
+        if order["status"] != "active":
+            raise ConflictError("撤离单已重新开放")
+        if order["equipment_returned"]:
+            raise ConflictError("装备已归还登记")
+        updated = self.repository.set_equipment_returned(order_id, actor)
+        self.repository.append_audit("evacuation_equipment", EVAC_ENTITY, order_id, actor, {
+            "order_no": order["order_no"], "returned": True,
+        })
+        return self._evacuation_detail(updated)
+
+    def reopen_evacuation(self, order_id: int, actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, REOPEN_ROLES)
+        actor = require_text(actor, "actor", 100)
+        order = self.repository.get_evacuation_order(order_id)
+        detail = self._evacuation_detail(order)
+        blockers = detail["reopen_blockers"]
+        if blockers:
+            raise ConflictError("；".join(blockers), details={
+                "missing_crews": detail["rollcall"]["unaccounted"],
+                "blockers": blockers,
+            })
+        updated = self.repository.reopen_evacuation_order(order_id, actor)
+        self.repository.append_audit("evacuation_reopen", EVAC_ENTITY, order_id, actor, {
+            "order_no": order["order_no"], "area": order["area"],
+        })
+        return self._evacuation_detail(updated)
+
+    def get_evacuation(self, order_id: int, role: str) -> Dict[str, Any]:
+        self._view(role)
+        return self._evacuation_detail(self.repository.get_evacuation_order(order_id))
+
+    def get_evacuation_by_no(self, order_no: str, role: str) -> Dict[str, Any]:
+        self._view(role)
+        return self._evacuation_detail(
+            self.repository.get_evacuation_order_by_no(order_no))
+
+    def list_evacuations(self, role: str, area: Optional[str] = None,
+                         status: Optional[str] = None) -> list:
+        self._view(role)
+        return [self._evacuation_detail(order) for order in
+                self.repository.list_evacuation_orders(area, status)]
+
+    def create_dispatch(self, payload: Dict[str, Any], actor: str,
+                        role: str) -> Dict[str, Any]:
+        ensure_role(role, DISPATCH_ROLES)
+        actor = require_text(actor, "actor", 100)
+        area = require_text(payload.get("area"), "area", 200)
+        title = require_text(payload.get("title"), "title", 200)
+        active = self.repository.active_evacuation_for_area(area)
+        if active is not None:
+            detail = self._evacuation_detail(active)
+            unaccounted = detail["rollcall"]["unaccounted"]
+            if unaccounted:
+                raise ConflictError(
+                    f"任务区{area}封锁中，存在未核销人员，无法派单", details={
+                        "area": area, "order_no": active["order_no"],
+                        "missing_crews": unaccounted,
+                    })
+        dispatch = self.repository.create_dispatch(area, title, actor)
+        self.repository.append_audit("dispatch_create", DISPATCH_ENTITY, dispatch["id"],
+                                     actor, {"area": area, "title": title})
+        return dispatch
 
     @staticmethod
     def enrich(item: Dict[str, Any]) -> Dict[str, Any]:

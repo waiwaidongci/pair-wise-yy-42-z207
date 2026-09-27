@@ -71,7 +71,12 @@ def make_handler(service: Service, static_dir: str):
                 status = 400
             else:
                 status = 500
-            self._json(status, {"error": exc.__class__.__name__, "message": str(exc)})
+            payload: Dict[str, Any] = {
+                "error": exc.__class__.__name__, "message": str(exc)}
+            details = getattr(exc, "details", None)
+            if details:
+                payload["details"] = details
+            self._json(status, payload)
 
         def do_GET(self) -> None:
             try:
@@ -98,6 +103,25 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"events": service.audit(role)})
+                elif path == "/api/evacuations":
+                    actor, role = self._identity()
+                    del actor
+                    query = parse_qs(urlparse(self.path).query)
+                    self._json(200, {"evacuations": service.list_evacuations(
+                        role, query.get("area", [None])[0],
+                        query.get("status", [None])[0])})
+                elif path.startswith("/api/evacuations/by-no/"):
+                    order_no = "/".join(path.split("/")[4:])
+                    actor, role = self._identity()
+                    self._json(200, service.get_evacuation_by_no(order_no, role))
+                elif path.startswith("/api/evacuations/"):
+                    try:
+                        order_id = int(path.rsplit("/", 1)[-1])
+                    except ValueError:
+                        self._json(404, {"error": "not_found"})
+                        return
+                    actor, role = self._identity()
+                    self._json(200, service.get_evacuation(order_id, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -119,6 +143,38 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif path == "/api/evacuations":
+                    self._json(201, service.create_evacuation(body, actor, role))
+                elif path.startswith("/api/evacuations/by-no/") and path.endswith("/reports"):
+                    order_no = "/".join(path.split("/")[4:-1])
+                    self._json(201, service.report_evacuation(
+                        order_no, body, actor, role))
+                elif path.startswith("/api/evacuations/") and path.endswith("/reviews"):
+                    try:
+                        order_id = int(path.split("/")[3])
+                    except ValueError:
+                        self._json(404, {"error": "not_found"})
+                    else:
+                        self._json(201, service.review_evacuation_crew(
+                            order_id, body, actor, role))
+                elif path.startswith("/api/evacuations/") and path.endswith("/equipment-return"):
+                    try:
+                        order_id = int(path.split("/")[3])
+                    except ValueError:
+                        self._json(404, {"error": "not_found"})
+                    else:
+                        self._json(200, service.return_equipment(
+                            order_id, body, actor, role))
+                elif path.startswith("/api/evacuations/") and path.endswith("/reopen"):
+                    try:
+                        order_id = int(path.split("/")[3])
+                    except ValueError:
+                        self._json(404, {"error": "not_found"})
+                    else:
+                        self._json(200, service.reopen_evacuation(
+                            order_id, actor, role))
+                elif path == "/api/dispatches":
+                    self._json(201, service.create_dispatch(body, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:

@@ -32,7 +32,17 @@ python3 app.py --db ./data.db --port 8319
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
 - `GET /api/audit`
 
-允许角色：field_commander, incident_commander, logistics, viewer。火线长度、风向变化和离线记录数量影响风险等级；同一资源不能同时出现在多个活动任务中。
+### 撤离点名与重新开放
+
+- `POST /api/evacuations`：登记撤离单（任务区、现场单号、班组名册，incident_commander）
+- `GET /api/evacuations`、`GET /api/evacuations/{id}`、`GET /api/evacuations/by-no/{order_no}`：查看点名结果
+- `POST /api/evacuations/by-no/{order_no}/reports`：班组按现场单号回报`arrived`/`missing`（field_commander、logistics）；同号重复沿用首次结果，矛盾状态留待核对
+- `POST /api/evacuations/{id}/reviews`：核对矛盾班组状态（incident_commander）
+- `POST /api/evacuations/{id}/equipment-return`：装备归还登记（logistics）
+- `POST /api/evacuations/{id}/reopen`：人员全部核销且装备归还后重新开放（incident_commander）
+- `POST /api/dispatches`：新派单；封锁任务区存在未核销人员时返回409并在`details.missing_crews`列出缺失班组
+
+允许角色：field_commander, incident_commander, logistics, viewer。火线长度、风向变化和离线记录数量影响风险等级；同一资源不能同时出现在多个活动任务中。点名判定在`src/rules.py`，台账存储在`src/repository.py`，请求入口在`src/http_api.py`。
 
 ## 测试
 
